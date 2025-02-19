@@ -1,6 +1,9 @@
 import sys
 import numpy as np
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QDoubleSpinBox, QSpinBox, QLabel
+)
 from PyQt5.QtGui import QPainter, QPen, QBrush, QFont, QPolygonF
 from PyQt5.QtCore import Qt, QPointF
 
@@ -114,11 +117,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("MDP Grid Planner")
+        # 기본 격자 크기 (초기: 5x5)
         self.grid_size = (5, 5)
         self.terminal_state = (self.grid_size[0]-1, self.grid_size[1]-1)  # 오른쪽 맨 아래
         self.start_state = (0, 0)  # 왼쪽 맨 위
         self.step_reward = -1
-        self.gamma = 0.9
+        self.gamma = 0.9  # 기본 감쇠율
         self.theta = 1e-4
 
         # 초기 V와 보상 설정
@@ -137,19 +141,46 @@ class MainWindow(QMainWindow):
         # 메인 위젯 및 레이아웃 구성
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout()
-        main_widget.setLayout(main_layout)
+        self.main_layout = QVBoxLayout()  # 나중에 격자 위젯을 다시 삽입하기 위해 멤버 변수로 저장
+        main_widget.setLayout(self.main_layout)
 
-        # 격자 표시 위젯
+        # [격자 크기 입력 위젯]
+        grid_size_layout = QHBoxLayout()
+        grid_size_label = QLabel("격자 크기 (행 x 열):")
+        self.rows_spin = QSpinBox()
+        self.rows_spin.setRange(2, 20)
+        self.rows_spin.setValue(self.grid_size[0])
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(2, 20)
+        self.cols_spin.setValue(self.grid_size[1])
+        grid_size_layout.addWidget(grid_size_label)
+        grid_size_layout.addWidget(self.rows_spin)
+        grid_size_layout.addWidget(self.cols_spin)
+        self.main_layout.addLayout(grid_size_layout)
+
+        # [감쇠율 조절 위젯]
+        gamma_layout = QHBoxLayout()
+        gamma_label = QLabel("감쇠율 (gamma):")
+        self.gamma_spin = QDoubleSpinBox()
+        self.gamma_spin.setRange(0, 1)
+        self.gamma_spin.setSingleStep(0.01)
+        self.gamma_spin.setDecimals(2)
+        self.gamma_spin.setValue(self.gamma)
+        self.gamma_spin.valueChanged.connect(self.change_gamma)
+        gamma_layout.addWidget(gamma_label)
+        gamma_layout.addWidget(self.gamma_spin)
+        self.main_layout.addLayout(gamma_layout)
+
+        # 격자 표시 위젯 (초기 격자)
         self.gridWidget = GridWidget(self.grid_size)
         self.gridWidget.setValues(self.V)
-        main_layout.addWidget(self.gridWidget)
+        self.main_layout.addWidget(self.gridWidget)
 
-        # 버튼들을 담을 레이아웃
+        # [버튼들을 담을 레이아웃]
         button_layout = QHBoxLayout()
-        main_layout.addLayout(button_layout)
+        self.main_layout.addLayout(button_layout)
 
-        # [초기화]
+        # [초기화] → 격자 크기와 감쇠율에 따라 다시 초기화 (새 격자 생성)
         btn_reset = QPushButton("초기화")
         btn_reset.clicked.connect(self.reset)
         button_layout.addWidget(btn_reset)
@@ -178,6 +209,11 @@ class MainWindow(QMainWindow):
         btn_show_policy = QPushButton("현 Value에 따른 Policy 표시")
         btn_show_policy.clicked.connect(self.show_policy)
         button_layout.addWidget(btn_show_policy)
+
+    # 감쇠율 변경 슬롯
+    def change_gamma(self, value):
+        self.gamma = value
+        print(f"감쇠율 변경: gamma = {self.gamma}")
 
     # -------------------------------------------------
     # 헬퍼 함수: 격자 환경 내에서 상태 전이 계산
@@ -250,7 +286,30 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------
     # 버튼 클릭 슬롯들
     def reset(self):
-        self.V = np.zeros(self.grid_size)
+        # 격자 크기 입력 위젯에서 새 값을 읽음
+        new_rows = self.rows_spin.value()
+        new_cols = self.cols_spin.value()
+        new_grid_size = (new_rows, new_cols)
+        if new_grid_size != self.grid_size:
+            # 격자 크기가 변경되었으면 새로 초기화
+            self.grid_size = new_grid_size
+            self.terminal_state = (self.grid_size[0]-1, self.grid_size[1]-1)
+            self.V = np.zeros(self.grid_size)
+            self.rewards = self.step_reward * np.ones(self.grid_size)
+            self.rewards[self.terminal_state] = 0
+            # 기존 gridWidget 제거 후 새로 생성
+            self.gridWidget.setParent(None)
+            self.gridWidget.deleteLater()
+            self.gridWidget = GridWidget(self.grid_size)
+            self.gridWidget.setValues(self.V)
+            # 맨 위쪽(레이아웃의 첫 번째 위치)에 추가
+            self.main_layout.insertWidget(2, self.gridWidget)
+        else:
+            # 격자 크기가 동일하면 V만 초기화
+            self.V = np.zeros(self.grid_size)
+            self.rewards = self.step_reward * np.ones(self.grid_size)
+            self.rewards[self.terminal_state] = 0
+
         self.gridWidget.setValues(self.V)
         self.gridWidget.clearPolicy()
         print("초기화 완료.")
