@@ -2,24 +2,63 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QDoubleSpinBox, QSpinBox, QLabel
+    QDoubleSpinBox, QSpinBox, QLabel, QDialog, QDialogButtonBox, QFormLayout, QCheckBox
 )
 from PyQt5.QtGui import QPainter, QPen, QBrush, QFont, QPolygonF
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, pyqtSignal
+
+# -------------------------------------------------
+# CellEditDialog: 셀 값을 편집하는 다이얼로그
+# -------------------------------------------------
+class CellEditDialog(QDialog):
+    def __init__(self, current_value, current_locked, parent=None):
+        super(CellEditDialog, self).__init__(parent)
+        self.setWindowTitle("셀 편집")
+        self.new_value = current_value
+        self.locked = current_locked
+
+        # 폼 레이아웃: 값(QDoubleSpinBox)와 고정 여부(QCheckBox)
+        layout = QFormLayout(self)
+        self.value_spin = QDoubleSpinBox(self)
+        self.value_spin.setRange(-1000, 1000)
+        self.value_spin.setDecimals(2)
+        self.value_spin.setValue(current_value)
+        layout.addRow("값:", self.value_spin)
+
+        self.lock_checkbox = QCheckBox("고정 (업데이트 시 변경 안됨)", self)
+        self.lock_checkbox.setChecked(current_locked)
+        layout.addRow("고정:", self.lock_checkbox)
+
+        # OK / Cancel 버튼
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def accept(self):
+        self.new_value = self.value_spin.value()
+        self.locked = self.lock_checkbox.isChecked()
+        super(CellEditDialog, self).accept()
+
 
 # -------------------------------------------------
 # GridWidget: 격자와 현재 Value, Policy(화살표)를 그리는 위젯
+#   - 셀 클릭 시 cellClicked 신호를 발생 (행, 열)
 # -------------------------------------------------
 class GridWidget(QWidget):
+    cellClicked = pyqtSignal(int, int)  # row, col
+
     def __init__(self, grid_size, parent=None):
         super(GridWidget, self).__init__(parent)
         self.grid_size = grid_size  # (rows, cols)
         self.V = np.zeros(grid_size)
+        self.fixed = np.zeros(grid_size, dtype=bool)  # 고정 여부
         self.policy = None          # 정책: {(row, col): action_string}
         self.terminal_state = (grid_size[0]-1, grid_size[1]-1)  # 오른쪽 맨 아래
 
-    def setValues(self, V):
+    def setData(self, V, fixed):
         self.V = V.copy()
+        self.fixed = fixed.copy()
         self.update()
 
     def setPolicy(self, policy):
@@ -47,6 +86,14 @@ class GridWidget(QWidget):
             return
         cell_w = w / cols
         cell_h = h / rows
+
+        # 각 셀 배경: 고정된 셀은 연한 회색으로 표시
+        for i in range(rows):
+            for j in range(cols):
+                x = j * cell_w
+                y = i * cell_h
+                if self.fixed[i, j]:
+                    qp.fillRect(int(x), int(y), int(cell_w), int(cell_h), QBrush(Qt.lightGray))
 
         # 그리드 선 그리기 (좌표를 int로 캐스팅)
         pen = QPen(Qt.black, 2)
@@ -109,6 +156,18 @@ class GridWidget(QWidget):
                         qp.setBrush(Qt.NoBrush)
                     qp.setPen(QPen(Qt.black, 2))
 
+    def mousePressEvent(self, event):
+        # 클릭한 위치에 해당하는 셀의 (row, col)을 계산 후 신호 발생
+        pos = event.pos()
+        rows, cols = self.grid_size
+        cell_w = self.width() / cols
+        cell_h = self.height() / rows
+        col = int(pos.x() // cell_w)
+        row = int(pos.y() // cell_h)
+        # 범위 내라면 신호 방출
+        if 0 <= row < rows and 0 <= col < cols:
+            self.cellClicked.emit(row, col)
+
 
 # -------------------------------------------------
 # MainWindow: 인터페이스와 업데이트 로직
@@ -125,8 +184,9 @@ class MainWindow(QMainWindow):
         self.gamma = 0.9  # 기본 감쇠율
         self.theta = 1e-4
 
-        # 초기 V와 보상 설정
+        # 초기 상태 가치(V)와 고정 여부(fixed) 배열 설정
         self.V = np.zeros(self.grid_size)
+        self.fixed = np.zeros(self.grid_size, dtype=bool)
         self.rewards = self.step_reward * np.ones(self.grid_size)
         self.rewards[self.terminal_state] = 0
 
@@ -141,7 +201,7 @@ class MainWindow(QMainWindow):
         # 메인 위젯 및 레이아웃 구성
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        self.main_layout = QVBoxLayout()  # 나중에 격자 위젯을 다시 삽입하기 위해 멤버 변수로 저장
+        self.main_layout = QVBoxLayout()  # 격자 위젯을 동적으로 교체하기 위해 멤버 변수로 저장
         main_widget.setLayout(self.main_layout)
 
         # [격자 크기 입력 위젯]
@@ -173,7 +233,8 @@ class MainWindow(QMainWindow):
 
         # 격자 표시 위젯 (초기 격자)
         self.gridWidget = GridWidget(self.grid_size)
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
+        self.gridWidget.cellClicked.connect(self.editCell)
         self.main_layout.addWidget(self.gridWidget)
 
         # [버튼들을 담을 레이아웃]
@@ -224,14 +285,16 @@ class MainWindow(QMainWindow):
         return new_state
 
     # -------------------------------------------------
-    # 최적 선택 업데이트: V(s) = max_a { R(s') + gamma * V(s') }
+    # 최적 선택 업데이트: 고정되지 않은 셀에 대해
+    # V(s) = max_a { R(s') + gamma * V(s') }
     def optimal_update(self):
         new_V = self.V.copy()
         delta = 0.0
         for i in range(self.grid_size[0]):
             for j in range(self.grid_size[1]):
                 state = (i, j)
-                if state == self.terminal_state:
+                # 터미널 또는 고정된 셀은 업데이트하지 않음
+                if state == self.terminal_state or self.fixed[i, j]:
                     continue
                 values = []
                 for action in self.actions.values():
@@ -243,7 +306,8 @@ class MainWindow(QMainWindow):
         self.V = new_V
         return delta
 
-    # 확률 업데이트: V(s) = (1/|A|) * sum_a { R(s') + gamma * V(s') }
+    # 확률 업데이트: 고정되지 않은 셀에 대해
+    # V(s) = (1/|A|) * sum_a { R(s') + gamma * V(s') }
     def probability_update(self):
         new_V = self.V.copy()
         delta = 0.0
@@ -251,7 +315,7 @@ class MainWindow(QMainWindow):
         for i in range(self.grid_size[0]):
             for j in range(self.grid_size[1]):
                 state = (i, j)
-                if state == self.terminal_state:
+                if state == self.terminal_state or self.fixed[i, j]:
                     continue
                 total = 0.0
                 for action in self.actions.values():
@@ -263,7 +327,7 @@ class MainWindow(QMainWindow):
         self.V = new_V
         return delta
 
-    # 현재 V에 따른 최적 정책 계산: 각 상태에서 max_a { R(s') + gamma * V(s') }를 주는 액션 선택
+    # 현재 V에 따른 최적 정책 계산: 고정되지 않은 셀만 업데이트
     def compute_policy(self):
         policy = {}
         for i in range(self.grid_size[0]):
@@ -271,6 +335,8 @@ class MainWindow(QMainWindow):
                 state = (i, j)
                 if state == self.terminal_state:
                     policy[state] = None
+                elif self.fixed[i, j]:
+                    policy[state] = None  # 고정된 셀은 정책 변경 없음
                 else:
                     best_action = None
                     best_val = -np.inf
@@ -284,6 +350,19 @@ class MainWindow(QMainWindow):
         return policy
 
     # -------------------------------------------------
+    # 셀 편집 슬롯: GridWidget의 cellClicked 신호 처리
+    def editCell(self, row, col):
+        # 현재 값과 고정 상태 읽기
+        current_value = self.V[row, col]
+        current_locked = self.fixed[row, col]
+        dialog = CellEditDialog(current_value, current_locked, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.V[row, col] = dialog.new_value
+            self.fixed[row, col] = dialog.locked
+            self.gridWidget.setData(self.V, self.fixed)
+            print(f"셀 ({row}, {col}) 수정: 값={dialog.new_value}, 고정={dialog.locked}")
+
+    # -------------------------------------------------
     # 버튼 클릭 슬롯들
     def reset(self):
         # 격자 크기 입력 위젯에서 새 값을 읽음
@@ -295,28 +374,29 @@ class MainWindow(QMainWindow):
             self.grid_size = new_grid_size
             self.terminal_state = (self.grid_size[0]-1, self.grid_size[1]-1)
             self.V = np.zeros(self.grid_size)
+            self.fixed = np.zeros(self.grid_size, dtype=bool)
             self.rewards = self.step_reward * np.ones(self.grid_size)
             self.rewards[self.terminal_state] = 0
             # 기존 gridWidget 제거 후 새로 생성
             self.gridWidget.setParent(None)
             self.gridWidget.deleteLater()
             self.gridWidget = GridWidget(self.grid_size)
-            self.gridWidget.setValues(self.V)
-            # 맨 위쪽(레이아웃의 첫 번째 위치)에 추가
+            self.gridWidget.setData(self.V, self.fixed)
+            self.gridWidget.cellClicked.connect(self.editCell)
             self.main_layout.insertWidget(2, self.gridWidget)
         else:
-            # 격자 크기가 동일하면 V만 초기화
+            # 격자 크기가 동일하면 V와 고정 상태만 초기화
             self.V = np.zeros(self.grid_size)
+            self.fixed = np.zeros(self.grid_size, dtype=bool)
             self.rewards = self.step_reward * np.ones(self.grid_size)
             self.rewards[self.terminal_state] = 0
-
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
         self.gridWidget.clearPolicy()
         print("초기화 완료.")
 
     def optimal_step(self):
         delta = self.optimal_update()
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
         self.gridWidget.clearPolicy()
         print(f"최적 선택 Step 업데이트: delta = {delta}")
 
@@ -327,13 +407,13 @@ class MainWindow(QMainWindow):
             iter_count += 1
             if delta < self.theta:
                 break
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
         self.gridWidget.clearPolicy()
         print(f"최적 선택 수렴 완료: {iter_count}회, delta = {delta}")
 
     def prob_step(self):
         delta = self.probability_update()
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
         self.gridWidget.clearPolicy()
         print(f"확률 기반 Step 업데이트: delta = {delta}")
 
@@ -344,7 +424,7 @@ class MainWindow(QMainWindow):
             iter_count += 1
             if delta < self.theta:
                 break
-        self.gridWidget.setValues(self.V)
+        self.gridWidget.setData(self.V, self.fixed)
         self.gridWidget.clearPolicy()
         print(f"확률 기반 수렴 완료: {iter_count}회, delta = {delta}")
 
@@ -360,6 +440,6 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.resize(600, 600)
+    window.resize(800, 800)
     window.show()
     sys.exit(app.exec_())
